@@ -1,7 +1,15 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import math
-import torch.nn as nn
+import pandas as pd
+from datasets import load_dataset
+import tiktoken
+import numpy as np
+import torch._inductor.config
+torch._inductor.config.triton.cudagraphs = False
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.allow_tf32 = True
 
 def scaled_dot_product_attention(query, key, value, mask=None, dropout=None):
     d_k = query.size(-1)
@@ -216,18 +224,12 @@ class GPT(nn.Module):
             yield token
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-batch_size = 32
-learning_rate = 3e-4
-max_iters = 1000
-eval_interval = 500
-eval_iters = 200
+batch_size = 512
+learning_rate = 1e-3
+max_iters = 8000
+eval_interval = 200
+eval_iters = 100
 block_size = 256
-
-import numpy as np
-import torch
-import pandas as pd
-from datasets import load_dataset
-import tiktoken
 
 dataset = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1")
 
@@ -264,19 +266,21 @@ print(f"Val: {val_data.shape}")
 
 model = GPT(
     vocab_size=enc.n_vocab,
-    d_model=32,
-    num_heads=4,
-    n_layer=3,
-    d_ff=128
+    d_model=512,
+    num_heads=8,
+    n_layer=8,
+    d_ff=2048,
+    dropout=0.1
     )
+model = torch.compile(model)
 
 print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = model.to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-scaler = torch.amp.GradScaler(enabled=(device == "cuda"))
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.1)
 losses = []
+avg_val_losses = []
 
 for iter_num in range(max_iters):
     ix = torch.randint(len(train_data), (batch_size, ))
@@ -287,11 +291,34 @@ for iter_num in range(max_iters):
         _, loss = model(x,y)
     
     optimizer.zero_grad(set_to_none=True)
-    scaler.scale(loss).backward()
-    scaler.step(optimizer)
-    scaler.update()
+    loss.backward()
+    optimizer.step()
 
     with torch.no_grad():
         losses.append(loss.item())
     
-    print(f"iter {iter_num}: loss {loss.item()}")
+    if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
+        model.eval()
+        with torch.no_grad():
+            val_losses = []
+            for _ in range(eval_iters):
+                ix = torch.randint(len(val_data), (batch_size, ))
+                x = val_data[ix, :-1]
+                y = val_data[ix, 1:]
+                _, val_loss = model(x, y)
+                val_losses.append(val_loss.item())
+            avg_val_loss = sum(val_losses) / len(val_losses)
+            avg_val_losses.append(avg_val_loss)
+        print(f"Iter {iter_num}: Train Loss {loss.item():.4f}, Val Loss {avg_val_loss:.4f}")
+        model.train()
+
+# plot
+import matplotlib.pyplot as plt
+plt.plot(losses)
+plt.plot(np.linspace(0, len(losses), len(avg_val_losses)), avg_val_losses)
+plt.xlabel("Iteration")
+plt.ylabel("Loss")
+plt.legend(["Train Loss", "Val Loss"])
+plt.show()
+# Save the model
+torch.save(model.state_dict(), "gpt_model.pth")
