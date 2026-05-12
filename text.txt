@@ -1,0 +1,1181 @@
+Right, here's the layer of practical stuff that's not in the guide but will eat your time if you don't see it coming.
+Reconcile the names first, before you do anything else. Open your notebook, find your CausalSelfAttention.__init__ and your GPTConfig. The guide assumes self.c_attn, self.c_proj, self.transformer.h, self.transformer.wpe, model.config, n_embd, n_head, n_layer. If yours uses self.attention, self.attn_proj, self.blocks, self.pos_emb, self.cfg, dim, n_heads, depth, do a global find-and-rename pass on my code into a fresh cell before you start reasoning about cache logic. Otherwise you'll be debugging "is this the cache or the names" simultaneously, which is awful.
+Thread start_pos through every forward signature. Easy to miss one. The chain is GPT.forward -> Block.forward -> CausalSelfAttention.forward. If you forget to add start_pos=None to Block.forward, calling block(x, start_pos=0) raises a TypeError. If you forget to pass it from GPT.forward into the block, the block silently uses its default (None), the attention runs the no-cache path, and your cache is unused but does not error. The second failure mode is the nasty one because correctness still passes (no-cache path is correct), but you see no speedup. Sanity check: print id(self.k_cache) inside attention's forward; should be non-None during decode.
+Keep your training forward path returning what it currently returns. If your existing code returns just logits and you change it to return (logits, loss) or vice versa, downstream code in your notebook breaks. The cache changes only matter for inference. Cleanest approach: don't modify the existing forward at all on the first pass. Add start_pos=None as a kwarg, branch internally, and keep the return shape exactly what it was. The lm_head[:, [-1], :] optimization can be a separate followup.
+Check block_size against max_seq_len. Your wpe is nn.Embedding(block_size, n_embd). If setup_caches(max_seq_len=2048) but block_size=1024, the moment your start_pos exceeds 1023 you get an index-out-of-bounds in the position embedding lookup, not in the cache code. The error message points at wpe, which sends you on a wild goose chase. Add an assert: assert max_seq_len <= self.config.block_size in setup_caches.
+Verify in fp32 before you touch bf16. Cache correctness verification under bf16 will probably almost match (greedy might match for the first 80 tokens then diverge once a near-tie in logits flips). That's a numerical artifact, not a bug, but you can't tell it from a real bug while debugging. Run all KV cache verification in pure fp32 first. Once it's passing, then switch to bf16 and accept that greedy match might break around 50-200 tokens.
+Don't torch.compile until cache correctness is solid. Compile turns clean Python errors into giant tracebacks through TorchDynamo internals. Get the eager cache working completely (correctness + speed both verified), then add compile as a separate experiment. If you want compile for everything from the start, at least set torch._logging.set_logs(recompiles=True) so you see when it's recompiling each step.
+torch.compile(model) returns a wrapper, and setup_caches lives on the original. Do model.setup_caches(...) before model = torch.compile(model), or call setup on model._orig_mod after compilation. If you call setup_caches on the compiled wrapper, you may either get an attribute error or it may silently set up caches on a copy that the compiled forward doesn't see. Order: model = GPT(cfg) -> .to(device) -> setup_caches(...) -> torch.compile(model). Move the setup call inside generate_cached and you have to be careful which object you're calling it on.
+For GQA, decide upfront whether you're loading old checkpoints. If you have any saved checkpoint from training that uses c_attn (the fused QKV), switching to separate q_proj/k_proj/v_proj makes your old state_dict un-loadable. If you don't care, just train fresh. If you do, you have two options: (a) write a small converter that splits c_attn.weight into three (the chunks are along dim 0, in QKV order in nanoGPT's convention), or (b) keep the old fused projection and just slice the output differently. Option (a) is cleaner; the converter is ten lines.
+Test-model sizing matters for the speed verification. A 4-layer, 128-dim model on XPU may not show the 3x speedup because Python overhead dominates over the actual attention compute that the cache saves. If your speed test underwhelms, scale up to n_layer=8, n_embd=512, n_head=8 and try again before assuming the cache code is wrong. The correctness test, in contrast, is fine on tiny models.
+Use a fresh kernel state when switching between cached and uncached. If you've been running cached generation, model.k_cache is allocated. If your no-cache reference somehow takes a code path that checks for cache presence, you'll get crossed signals. Always call model.clear_caches() before running the no-cache reference, and use try/finally to clear after every cached run. This is in the guide but worth re-emphasizing because hung cache state is the single most common "why does my second run produce different output than my first" cause.
+The first decode step uses the freshly sampled token, not the prompt's last token. Easy to write next_token = idx[:, -1:] instead of next_token = sampled_token for the first decode iteration. Both have shape (B, 1), both are valid input to the model, but the first one re-predicts the same token you already have, wasting a step and shifting all your output positions by one.
+Don't bother optimizing out = torch.cat([out, next_token], dim=1). It's the obvious thing to optimize after seeing it in a profiler, but it's tiny next to the actual model forward. Pre-allocating out saves microseconds at the cost of code clarity. Leave it alone until you've done everything else.
+That's the integration layer. The thing that's going to bite you most is the silent failure where cache is set up but not used because you forgot to pass start_pos through one layer. Add an assert or a print early in attention.forward to confirm you're hitting the cached branch.
+
+3:
+
+Sufficient as-is:
+A3 KV cache, A4 GQA, A5 bf16, A7 MoE (with the visualization addendum) are all implementable from what's there. Code works, correctness checks are present, you can hit the "done when" criteria. The MoE visualization is genuinely good for seeing routing collapse vs balance.
+Not sufficient:
+C1 PagedAttention is the big one. What's in your transcript is a skeleton: one PagedKVCache class with allocate/free, and a print statement. The actual "done when" requires (a) byte-for-byte match with the contiguous cache, (b) two concurrent sequences with a shared block allocator and proper free-on-completion, (c) <10% memory waste measurement on mixed lengths. None of those are implemented. You'd need per-sequence block tables, the integration into the attention forward pass (gather-from-blocks logic), a tiny scheduler that runs two sequences in lockstep, and the waste accounting. That's most of the C1 work and it's missing.
+Subtle bug in the A3 code you should know about:
+CausalSelfAttentionGQA.forward sets is_causal=False whenever cache is provided, including during prefill where T>1. The greedy output still matches no-cache because only the last query position's logits drive the next token, and the last position attends to all prior positions causally either way. But it's conceptually wrong and breaks if you ever want logprobs for non-last prefill positions, do speculative decoding (where you need correct logits at multiple positions), or prefix caching. The fix: pass is_causal=True when cache_pos == 0 and T > 1 (pure prefill), and use a position-based mask when prefill is mid-cache.
+Conceptual gaps not covered:
+Your task list has explicit follow-up questions for each item. Almost none are addressed in the transcript:
+
+Why pre-allocated cache beats dynamic growth (allocator calls in the hot path, fixed shapes for torch.compile, CUDA graph capture)
+Prefill vs decode framing (compute-bound vs memory-bound regimes, why decode is the one that benefits from KV cache the most)
+repeat_interleave vs expand for GQA head replication (expand is a view, repeat_interleave allocates)
+bf16 vs fp16 (8 exponent bits vs 5, why no GradScaler)
+Why the aux loss is N · Σ f_i · p_i rather than KL (it has to be differentiable through p_i since f_i from argmax is not, and it incentivizes both traffic and probability mass to spread)
+Top-1 vs top-2 vs top-k tradeoffs (compute budget vs gradient signal to unselected experts)
+Block size choice for paged attention (indexing overhead vs internal fragmentation)
+How prefix caching plugs into the block allocator (refcounted blocks, copy-on-write on divergence)
+
+You can derive most of these on the plane if you've internalized the basic math, but it's the kind of thing you'd want bullet-point notes on rather than reasoning from scratch at 35,000 ft.
+Also missing for "done when" verification:
+A4's done-when says "validation loss within 3% across MHA/GQA-4/MQA after a short training run." There's no training loop for that comparison in the transcript. You'd need to write a small train-and-eval harness that swaps n_kv_heads.
+A7's done-when says "auxiliary loss going down during training, expert utilization roughly uniform on a held-out batch." The visualization is there but the training loop with aux loss tracking over steps isn't.
+What I'd ask for before you board:
+
+The actual C1 implementation: paged attention forward integrated into the model, per-sequence block tables, two-sequence concurrent demo with allocator and free-on-EOS, memory waste calculation. Targeted at small scale (block_size=16, 64 blocks total, 2-4 sequences) so it runs in seconds on XPU.
+The A3 prefill mask fix.
+A short "first principles + follow-up answers" markdown doc covering the conceptual gaps above. You can read it on the plane without running anything.
+A small training harness that does the MHA/GQA/MQA comparison and the MoE aux-loss-over-time curve, so you can actually mark A4 and A7 as done.
+
+Want me to produce all four now? I'd put them as standalone code blocks plus one markdown doc, all in this conversation so you can copy them into cells before you lose wifi.You said: teach me everything there from first principles, both the understanding of how it works and the implementation.teach me everything there from first principles, both the understanding of how it works and the implementation.5:54 PMClaude responded: I'll teach this end to end, building on your existing GPT (RoPE, RMSNorm, SwiGLU, fused QKV).Architected comprehensive first-principles teaching guide spanning five advanced optimization techniquesArchitected comprehensive first-principles teaching guide spanning five advanced optimization techniquesI'll teach this end to end, building on your existing GPT (RoPE, RMSNorm, SwiGLU, fused QKV). Each section: theory from first principles, then code that drops into a notebook cell, then verification.
+Part 1: KV Cache (A3)
+Why caching is even possible
+Look at causal self-attention during generation. At step t you have tokens x_1, ..., x_t and want the next token. You compute:
+Q_t = x_t @ W_Q
+K_i = x_i @ W_K   for i = 1..t
+V_i = x_i @ W_V   for i = 1..t
+attn = softmax(Q_t @ K^T / sqrt(d)) @ V
+Now go to step t+1. You compute K_i and V_i for i = 1..t+1. The first t are identical to what you computed at step t, because K_i only depends on x_i and W_K, both of which are fixed. So recomputing them is pure waste.
+The only thing that changes between steps is: a new Q_{t+1}, a new K_{t+1}, a new V_{t+1}, and one new row of attention output. So the cache stores K and V for all past tokens, and at each decode step you compute one new K, one new V, one new Q, and one new attention row.
+The two regimes: prefill vs decode
+Prefill: you have a prompt of length P. You run the prompt through the model once. Inside attention this is a normal (B, H, P, D) @ (B, H, D, P) matmul, which is compute-bound (FLOPs limited). You produce K, V for all P positions and write them all into the cache.
+Decode: you generate one token at a time. Each step has a Q of shape (B, H, 1, D), you append one row of K, V to the cache, and you do (B, H, 1, D) @ (B, H, D, T_cached). This is memory-bound: the bottleneck is reading the cache, not the FLOPs. This is why decode looks wasteful and why KV cache helps decode much more than prefill.
+Why pre-allocate
+Two reasons:
+
+Allocator overhead: torch.cat on every decode step allocates new memory and copies the old cache into the new buffer. That's O(T) copy work per step, making total decode cost O(T²) just from concatenation.
+Static shapes for compile/CUDA graphs: torch.compile and CUDA graphs both prefer fixed tensor shapes. A pre-allocated (B, H_kv, max_seq, D) buffer has the same shape every step. You only change which slice you read, controlled by an integer index. That index is dynamic but the tensor isn't, so no recompilation.
+
+Causal masking with a cache
+When you have a contiguous (1, H, T_cached, D) cache and a single new query (1, H, 1, D), that query needs to attend to all T_cached positions. There's no future to mask, because the new query is the most recent token. So during single-token decode, no mask is needed. You just call SDPA with is_causal=False.
+During prefill (T > 1) starting from cache_pos=0, is_causal=True is correct because each prefill query at position i should only see positions 0..i.
+There's a tricky third case (you decode T>1 tokens at a time mid-cache, e.g. speculative decoding): then you need a custom mask. Skip that for now.
+RoPE and the cache: the gotcha
+Your existing apply_rope does cos[:T], which assumes the queries/keys are at positions 0..T-1. During decode, your one new token is at position cache_pos, NOT position 0. If you apply cos[0] to a token that's actually at position 47, you get garbage that doesn't match what no-cache generation produced. This is the most common KV cache bug. The fix is a position-aware RoPE.
+The implementation
+Build on your existing class names. This is a new module, paste in a new cell:
+pythonimport math, time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def apply_rope_at_positions(q, k, cos, sin, start_pos):
+    """RoPE that knows where in the sequence we are.
+
+    q, k: (B, H, T, D)
+    cos, sin: (max_seq, D)  precomputed for ALL positions
+    start_pos: int, position of q[..., 0, :] in the full sequence
+    """
+    T = q.shape[-2]
+    cos = cos[start_pos:start_pos + T][None, None, :, :].to(q.dtype)
+    sin = sin[start_pos:start_pos + T][None, None, :, :].to(q.dtype)
+    q = q * cos + rotate_half(q) * sin
+    k = k * cos + rotate_half(k) * sin
+    return q, k
+
+
+class KVCache:
+    """Per-layer pre-allocated KV cache.
+
+    Stored shape: (B, n_kv_heads, max_seq, head_dim).
+    write_pos tracks how many tokens are currently valid.
+    """
+    def __init__(self, n_layers, batch, n_kv_heads, max_seq, head_dim, device, dtype):
+        self.n_layers = n_layers
+        self.batch = batch
+        self.n_kv_heads = n_kv_heads
+        self.max_seq = max_seq
+        self.head_dim = head_dim
+        self.k = [torch.zeros(batch, n_kv_heads, max_seq, head_dim,
+                              device=device, dtype=dtype) for _ in range(n_layers)]
+        self.v = [torch.zeros(batch, n_kv_heads, max_seq, head_dim,
+                              device=device, dtype=dtype) for _ in range(n_layers)]
+        self.length = 0  # how many tokens are written (shared across layers)
+
+    def reset(self):
+        self.length = 0
+
+    def write(self, layer_idx, k_new, v_new, start):
+        """Write k_new, v_new into positions [start, start+T_new)."""
+        T_new = k_new.size(2)
+        self.k[layer_idx][:, :, start:start + T_new, :] = k_new
+        self.v[layer_idx][:, :, start:start + T_new, :] = v_new
+
+    def read(self, layer_idx, end):
+        return self.k[layer_idx][:, :, :end, :], self.v[layer_idx][:, :, :end, :]
+Now the cache-aware multi-head attention. I'm rewriting yours with a cache and cache_pos argument, plus the position-aware RoPE:
+pythonclass MultiHeadAttentionCached(nn.Module):
+    def __init__(self, d_model, num_heads, max_seq_len=512, dropout=0.0, rope_base=10000.0):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        assert self.head_dim % 2 == 0
+
+        self.W_qkv = nn.Linear(d_model, 3 * d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        inv_freq = 1.0 / (rope_base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        t = torch.arange(max_seq_len).float()
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        self.register_buffer("rope_cos", emb.cos(), persistent=False)
+        self.register_buffer("rope_sin", emb.sin(), persistent=False)
+
+    def split_heads(self, x, n_heads):
+        B, L, _ = x.size()
+        return x.view(B, L, n_heads, self.head_dim).transpose(1, 2)
+
+    def combine_heads(self, x):
+        B, H, L, Hd = x.size()
+        return x.transpose(1, 2).contiguous().view(B, L, H * Hd)
+
+    def forward(self, x, layer_idx=None, cache=None, cache_pos=0):
+        qkv = self.W_qkv(x)
+        Q, K, V = qkv.chunk(3, dim=-1)
+        Q = self.split_heads(Q, self.num_heads)
+        K = self.split_heads(K, self.num_heads)
+        V = self.split_heads(V, self.num_heads)
+
+        # Apply RoPE at the absolute positions where these tokens live.
+        Q, K = apply_rope_at_positions(Q, K, self.rope_cos, self.rope_sin, cache_pos)
+
+        if cache is None:
+            # Training / no-cache forward.
+            attn_out = F.scaled_dot_product_attention(
+                Q, K, V,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            # Inference path with cache.
+            cache.write(layer_idx, K, V, cache_pos)
+            K_full, V_full = cache.read(layer_idx, cache_pos + Q.size(-2))
+
+            # Prefill: cache_pos == 0 and T > 1, use is_causal=True (we wrote all positions).
+            # Decode: T == 1, cache contains everything; no mask needed (single new query).
+            T_new = Q.size(-2)
+            is_causal = (cache_pos == 0 and T_new > 1)
+            attn_out = F.scaled_dot_product_attention(
+                Q, K_full, V_full,
+                dropout_p=0.0,
+                is_causal=is_causal,
+            )
+
+        attn_out = self.combine_heads(attn_out)
+        attn_out = self.W_o(attn_out)
+        attn_out = self.dropout(attn_out)
+        return attn_out
+Now a thin wrapper around your existing GPT that threads cache and cache_pos through. The cleanest way is to write a parallel GPTCached that takes your existing components but uses the new attention. Paste this:
+pythonclass DecoderLayerCached(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff, max_seq_len, dropout, attn_cls):
+        super().__init__()
+        self.self_attn = attn_cls(d_model, num_heads, max_seq_len, dropout)
+        self.feed_forward = SwiGLUFeedForward(d_model, d_ff, dropout)  # reuse yours
+        self.norm1 = RMSNorm(d_model)
+        self.norm3 = RMSNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def forward(self, x, layer_idx=None, cache=None, cache_pos=0):
+        a = self.self_attn(self.norm1(x), layer_idx=layer_idx, cache=cache, cache_pos=cache_pos)
+        x = x + self.dropout1(a)
+        f = self.feed_forward(self.norm3(x))
+        x = x + self.dropout3(f)
+        return x
+
+
+class GPTCached(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads, d_ff, n_layer,
+                 dropout=0.1, max_seq_len=512, attn_cls=MultiHeadAttentionCached):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.n_layer = n_layer
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.d_model = d_model
+
+        self.wte = nn.Embedding(vocab_size, d_model)
+        self.layers = nn.ModuleList([
+            DecoderLayerCached(d_model, num_heads, d_ff, max_seq_len, dropout, attn_cls)
+            for _ in range(n_layer)
+        ])
+        self.norm = RMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.wte.weight
+
+        self.apply(self._init)
+
+    def _init(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None, cache=None, cache_pos=0):
+        x = self.wte(idx)
+        for i, layer in enumerate(self.layers):
+            x = layer(x, layer_idx=i, cache=cache, cache_pos=cache_pos)
+        x = self.norm(x)
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
+
+    def new_cache(self, batch, max_seq, n_kv_heads=None, dtype=None):
+        p = next(self.parameters())
+        n_kv_heads = n_kv_heads if n_kv_heads is not None else self.num_heads
+        return KVCache(self.n_layer, batch, n_kv_heads, max_seq,
+                       self.head_dim, p.device, dtype or p.dtype)
+Generation in two flavors. The no-cache version is your reference; the cache version must produce identical tokens at greedy:
+python@torch.inference_mode()
+def generate_no_cache(model, prompt_ids, max_new):
+    ids = prompt_ids.clone()
+    for _ in range(max_new):
+        ids_cond = ids[:, -model.max_seq_len:]
+        logits, _ = model(ids_cond)
+        nxt = logits[:, -1, :].argmax(-1, keepdim=True)
+        ids = torch.cat([ids, nxt], dim=1)
+    return ids
+
+
+@torch.inference_mode()
+def generate_with_cache(model, prompt_ids, max_new):
+    B, P = prompt_ids.shape
+    cache = model.new_cache(B, P + max_new)
+
+    # Prefill: write all P prompt tokens at once.
+    logits, _ = model(prompt_ids, cache=cache, cache_pos=0)
+    nxt = logits[:, -1, :].argmax(-1, keepdim=True)
+    out = torch.cat([prompt_ids, nxt], dim=1)
+    pos = P
+
+    # Decode: one token per step.
+    for _ in range(max_new - 1):
+        logits, _ = model(nxt, cache=cache, cache_pos=pos)
+        pos += 1
+        nxt = logits[:, -1, :].argmax(-1, keepdim=True)
+        out = torch.cat([out, nxt], dim=1)
+    return out
+Verification
+pythondef get_device():
+    if hasattr(torch, "xpu") and torch.xpu.is_available(): return "xpu"
+    if torch.cuda.is_available(): return "cuda"
+    return "cpu"
+
+device = get_device()
+torch.manual_seed(0)
+
+model = GPTCached(vocab_size=512, d_model=128, num_heads=4, d_ff=256,
+                  n_layer=4, dropout=0.0, max_seq_len=512).to(device).eval()
+
+prompt = torch.randint(0, 512, (1, 16), device=device)
+
+a = generate_no_cache(model, prompt, max_new=100)
+b = generate_with_cache(model, prompt, max_new=100)
+
+print("exact match:", torch.equal(a, b))
+print("first 20 tokens (no cache):", a[0, :20].tolist())
+print("first 20 tokens (cached): ", b[0, :20].tolist())
+If exact match is False, the typical culprits are: RoPE position mismatch (you forgot cache_pos), wrong is_causal during prefill, or you cached the post-RoPE K but forgot that the cached K should be the same as a fresh-computed K at that absolute position. In our code we cache post-RoPE K because we apply RoPE before write, so the read-back is already rotated. Future steps don't re-rotate cached K, only the new K. That's correct because RoPE depends on absolute position, and each token's K is rotated once at the moment it's first computed.
+Speedup measurement
+pythondef bench(fn, model, prompt, steps, warmup=2, repeats=3):
+    for _ in range(warmup): fn(model, prompt, steps)
+    if device != "cpu": getattr(torch, device).synchronize()
+    t0 = time.perf_counter()
+    for _ in range(repeats): fn(model, prompt, steps)
+    if device != "cpu": getattr(torch, device).synchronize()
+    return repeats * steps / (time.perf_counter() - t0)
+
+prompt = torch.randint(0, 512, (1, 32), device=device)
+nc = bench(generate_no_cache, model, prompt, steps=100)
+wc = bench(generate_with_cache, model, prompt, steps=100)
+print(f"no-cache: {nc:.1f} tok/s")
+print(f"cached:   {wc:.1f} tok/s")
+print(f"speedup:  {wc/nc:.2f}x")
+At 100 generated tokens with a 32-token prompt, you should see 3x or more on a small model. The speedup grows with the maximum sequence length because the no-cache cost is O(T²) per step (it re-runs the whole prefix) while cached decode is O(T) per step.
+Follow-ups answered
+Why does pre-allocating give a bigger speedup on CUDA than dynamic growing? Two compounding effects. First, CUDA's caching allocator is fast but not free; every torch.cat triggers an allocation request, a memcpy of the existing cache into the new buffer, and a dealloc. On the CUDA stream this is latency-bound, and at small per-step compute, allocator overhead dominates. Second, fixed shapes let CUDA Graphs and torch.compile capture the decode step once and replay it. Replay skips Python, dispatch, and most launch latency. Neither works if the cache shape grows every step, because each new shape triggers a fresh capture/recompile.
+How will sliding-window or static-cache variants differ? Sliding-window keeps only the last W tokens, so you have a (B, H, W, D) ring buffer. You write into (write_idx % W) and the attention sees a cyclic view; you need a position mask to mark which slots are valid (during the warm-up phase) and to handle the wraparound. Static-cache (HuggingFace's name) is just our pre-allocated cache, but with the explicit invariant that the buffer shape never changes during a generation, so it's compile-friendly. Both differ from our naive contiguous cache in that they impose a fixed memory budget regardless of generation length.
+
+Part 2: GQA (A4)
+The intuition
+In standard MHA you have H query heads and H key/value heads. The KV cache size is 2 * B * H * T * D_head * bytes_per_elem. At inference, this cache is read every decode step, and it sits in HBM. So decode throughput is bottlenecked by how much KV you're streaming through memory per step.
+If you reduce KV heads from H to G while keeping H query heads, the cache shrinks by H/G. With 4 query heads and 1 KV head (MQA, the extreme), you get a 4x smaller cache. With 8 query heads and 2 KV heads (GQA-4 in the SmolLM3 sense), 4x smaller.
+The trick is that each KV head is shared across multiple query heads. At attention time, you "broadcast" each KV head to its query heads. There are H/G query heads per KV head, called the replication factor (n_rep).
+Why this even works
+Multi-head attention learns multiple specialized "lookup" patterns. The query is the question, K is the key being indexed, V is the value retrieved. Empirically, queries differ a lot across heads (different semantic projections), but the keys and values can be shared with little quality loss. Intuition: many of the lookup queries can hit the same value table. SmolLM3's ablations showed GQA-4 ties MHA in validation loss, so this is empirically robust.
+Memory accounting
+For a model with B=8, T=2048, D_head=64, fp16 (2 bytes), L=24 layers:
+MHA  (H=32):   2 * 8 * 32 * 2048 * 64 * 2 * 24 = 6.4 GB
+GQA-4 (G=8):   2 * 8 *  8 * 2048 * 64 * 2 * 24 = 1.6 GB
+MQA   (G=1):   2 * 8 *  1 * 2048 * 64 * 2 * 24 = 0.2 GB
+That's a 4x increase in max batch size with GQA, which directly multiplies tokens-per-second.
+Head replication: expand vs repeat_interleave
+You need to take K: (B, G, T, D) and turn it into (B, H, T, D) where each KV head is repeated H/G times. Two ways:
+python# Method 1: expand (no copy, just a stride trick)
+K = K[:, :, None, :, :]                                     # (B, G, 1, T, D)
+K = K.expand(B, G, n_rep, T, D)                             # broadcast view
+K = K.reshape(B, G * n_rep, T, D)                           # FORCED copy here
+
+# Method 2: repeat_interleave (immediate copy)
+K = K.repeat_interleave(n_rep, dim=1)                       # (B, G*n_rep, T, D)
+Both result in a copy because SDPA needs a contiguous tensor. expand + reshape triggers the copy at reshape. repeat_interleave does it explicitly. In benchmarks they're typically within 5% of each other on PyTorch. The "expand is free" claim only holds if you can avoid the contiguous reshape, which SDPA cannot. In practice prefer expand + reshape because if a downstream kernel ever supports broadcast, you save the copy automatically. Some attention kernels (FlashAttention, FlexAttention) do support this and skip the materialization.
+Implementation
+Modify the attention to support GQA. Replace MultiHeadAttentionCached with this:
+pythondef repeat_kv(x, n_rep):
+    """(B, G, T, D) -> (B, G*n_rep, T, D), broadcast each KV head n_rep times."""
+    if n_rep == 1:
+        return x
+    B, G, T, D = x.shape
+    return x[:, :, None, :, :].expand(B, G, n_rep, T, D).reshape(B, G * n_rep, T, D)
+
+
+class GQAttentionCached(nn.Module):
+    def __init__(self, d_model, num_heads, num_kv_heads=None,
+                 max_seq_len=512, dropout=0.0, rope_base=10000.0):
+        super().__init__()
+        assert d_model % num_heads == 0
+        num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        assert num_heads % num_kv_heads == 0
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = d_model // num_heads
+        self.n_rep = num_heads // num_kv_heads
+        self.kv_dim = num_kv_heads * self.head_dim
+        assert self.head_dim % 2 == 0
+
+        # Separate Q vs K,V projections because they have different output sizes now.
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_k = nn.Linear(d_model, self.kv_dim, bias=False)
+        self.W_v = nn.Linear(d_model, self.kv_dim, bias=False)
+        self.W_o = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+        inv_freq = 1.0 / (rope_base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        t = torch.arange(max_seq_len).float()
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        self.register_buffer("rope_cos", emb.cos(), persistent=False)
+        self.register_buffer("rope_sin", emb.sin(), persistent=False)
+
+    def forward(self, x, layer_idx=None, cache=None, cache_pos=0):
+        B, T, _ = x.shape
+        Q = self.W_q(x).view(B, T, self.num_heads,    self.head_dim).transpose(1, 2)
+        K = self.W_k(x).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        V = self.W_v(x).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        Q, K = apply_rope_at_positions(Q, K, self.rope_cos, self.rope_sin, cache_pos)
+
+        if cache is None:
+            K_full, V_full = K, V
+            is_causal = True
+        else:
+            cache.write(layer_idx, K, V, cache_pos)
+            K_full, V_full = cache.read(layer_idx, cache_pos + T)
+            is_causal = (cache_pos == 0 and T > 1)
+
+        # Replicate KV heads to match query heads, then do attention.
+        K_full = repeat_kv(K_full, self.n_rep)
+        V_full = repeat_kv(V_full, self.n_rep)
+
+        attn = F.scaled_dot_product_attention(
+            Q, K_full, V_full,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            is_causal=is_causal,
+        )
+        out = attn.transpose(1, 2).contiguous().view(B, T, self.d_model)
+        return self.dropout(self.W_o(out))
+Now build the model with this attention class. GPTCached already accepts attn_cls. You also need to tell new_cache the right n_kv_heads. Add a small wrapper:
+pythonclass GPTGQA(GPTCached):
+    def __init__(self, vocab_size, d_model, num_heads, num_kv_heads, d_ff, n_layer,
+                 dropout=0.1, max_seq_len=512):
+        # Build with the cached MHA first (we'll replace attn modules below).
+        super().__init__(vocab_size, d_model, num_heads, d_ff, n_layer,
+                         dropout=dropout, max_seq_len=max_seq_len,
+                         attn_cls=MultiHeadAttentionCached)
+        self.num_kv_heads = num_kv_heads
+        # Replace each layer's attention with a GQA one.
+        for layer in self.layers:
+            layer.self_attn = GQAttentionCached(
+                d_model, num_heads, num_kv_heads, max_seq_len, dropout
+            )
+        self.apply(self._init)
+
+    def new_cache(self, batch, max_seq, dtype=None):
+        return super().new_cache(batch, max_seq, n_kv_heads=self.num_kv_heads, dtype=dtype)
+Verification
+Memory scaling check, then a small training comparison so you can mark the "done when" condition:
+pythontorch.manual_seed(0)
+results = {}
+for tag, n_kv in [("MHA", 8), ("GQA-4", 2), ("MQA", 1)]:
+    m = GPTGQA(vocab_size=512, d_model=128, num_heads=8, num_kv_heads=n_kv,
+               d_ff=256, n_layer=4, dropout=0.0, max_seq_len=256).to(device)
+    c = m.new_cache(batch=1, max_seq=256)
+    bytes_total = sum(t.numel() * t.element_size() for t in c.k + c.v)
+    print(f"{tag:6} n_kv={n_kv}: cache={bytes_total/1e3:.1f} KB")
+    results[tag] = m
+Expect cache sizes in a 4:1:0.5 ratio (MHA:GQA-4:MQA at 8:2:1 KV heads).
+For the validation-loss-within-3% criterion, do a quick training comparison on TinyStories. Reuse your existing get_batch:
+pythondef quick_train(model, steps=300, lr=3e-4, block_size=128, batch_size=16):
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.1)
+    model.train()
+    for _ in range(steps):
+        x, y = get_batch("train", batch_size, block_size, device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            _, loss = model(x, y)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+
+    model.eval()
+    with torch.no_grad():
+        vs = []
+        for _ in range(20):
+            x, y = get_batch("val", batch_size, block_size, device)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                _, l = model(x, y)
+            vs.append(l.item())
+    return sum(vs) / len(vs)
+
+
+# Re-init each model with the same vocab_size from your tokenizer
+val_losses = {}
+for tag, n_kv in [("MHA", 4), ("GQA-2", 2), ("MQA", 1)]:
+    torch.manual_seed(0)
+    m = GPTGQA(vocab_size=vocab_size, d_model=192, num_heads=4, num_kv_heads=n_kv,
+               d_ff=512, n_layer=4, dropout=0.1, max_seq_len=128).to(device)
+    val_losses[tag] = quick_train(m, steps=300)
+    print(f"{tag}: val loss {val_losses[tag]:.4f}")
+
+# 3% check
+mha_loss = val_losses["MHA"]
+for tag, vl in val_losses.items():
+    pct = 100 * (vl - mha_loss) / mha_loss
+    print(f"{tag}: {pct:+.2f}% vs MHA")
+300 steps is small; expect noisy results, but you should see all three within a few percent at this scale. The "done when" criterion is realistic at much longer training; this just demonstrates the mechanic and gives you a number to compare.
+Follow-ups answered
+repeat_interleave vs expand for replication: covered above. expand is a stride trick (no copy), but downstream you almost always need .contiguous() or .reshape() for SDPA, which materializes. Functionally equivalent in PyTorch SDPA; expand is preferred for futureproofing because some kernels skip the materialization.
+Mapping a Llama-3 8B checkpoint into your GQA module: Llama-3 8B has 32 query heads, 8 KV heads, head_dim 128, so d_model = 32*128 = 4096 and kv_dim = 8*128 = 1024. Their weights are stored as separate wq, wk, wv linears with shapes (4096, 4096), (4096, 1024), (4096, 1024). Map directly to your W_q.weight, W_k.weight, W_v.weight. The only subtlety is RoPE: Llama uses the same RoPE formula but their interleaving convention is different (they interleave pairs (x0,x1), (x2,x3), ... whereas the half-and-half scheme (x0..xD/2-1, xD/2..xD-1) you have here is different). You either rewrite rotate_half to match Llama's interleave, or you permute the input dimensions of wq, wk so your half-and-half RoPE produces the same numbers. The latter is what HuggingFace does internally.
+
+Part 3: bf16 + torch.compile (A5)
+Float formats from first principles
+A floating point number is (-1)^sign * 2^(exponent - bias) * 1.mantissa. Three numbers matter: sign bits (always 1), exponent bits (sets dynamic range), mantissa bits (sets precision).
+fp32:  1 sign, 8 exp, 23 mantissa.  range ~10^-38 to 10^38, ~7 decimal digits precision
+fp16:  1 sign, 5 exp, 10 mantissa.  range ~6e-5 to 6e4,    ~3 decimal digits precision
+bf16:  1 sign, 8 exp, 7 mantissa.   range ~10^-38 to 10^38, ~2 decimal digits precision
+bf16 keeps fp32's exponent (same dynamic range) but slashes the mantissa. fp16 keeps more precision but its dynamic range is narrow. In neural net training, gradients can be very small (small layer weights, deep stacks). With fp16, small gradients underflow to zero and updates vanish. With bf16, the gradient stays representable; you lose precision but the magnitude is intact.
+Why fp16 needs GradScaler
+GradScaler multiplies the loss by a large constant S before backward. By chain rule, all gradients are scaled by S, pushing them up out of the fp16 underflow region. Right before the optimizer step, you unscale_ to divide back by S. If any gradient was inf or NaN, GradScaler rejects the step and tries a smaller S.
+bf16 has fp32's exponent range. There's no underflow risk for normal gradient magnitudes. No scaler needed, ever. Code becomes shorter and safer.
+What changes in your training loop
+Your current loop:
+pythonscaler = torch.amp.GradScaler(device=device)
+with torch.autocast(device_type=device, dtype=torch.float16):
+    _, loss = model(x, y)
+optimizer.zero_grad(set_to_none=True)
+scaler.scale(loss).backward()
+scaler.unscale_(optimizer)
+torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+scaler.step(optimizer)
+scaler.update()
+bf16 version:
+pythonwith torch.autocast(device_type=device, dtype=torch.bfloat16):
+    _, loss = model(x, y)
+optimizer.zero_grad(set_to_none=True)
+loss.backward()
+torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+optimizer.step()
+That's it. Delete the scaler entirely. Gradients are stored in fp32 (because parameters are fp32; autocast only affects forward/backward intermediates), so optimizer state stays high-precision.
+What torch.compile actually does
+torch.compile(model, mode="...") traces the forward pass into an FX graph (using TorchDynamo), then lowers it to optimized kernels via Inductor (Triton on CUDA, generally CPU codegen elsewhere; XPU support is partial and rapidly evolving).
+Three modes worth knowing:
+
+default: graph capture, mild kernel fusion, low compile cost.
+reduce-overhead: also enables CUDA Graphs to skip Python and launch overhead per step. Best for small batch decode where each kernel is short and per-launch overhead dominates.
+max-autotune: also runs heuristic search over kernel parameters (block sizes, num_warps, etc.). Best for long-running training where compile cost amortizes.
+
+The model size where max-autotune wins is roughly: large enough that kernel runtime dwarfs compile cost. For 1M-param toy models, compile cost is the dominant cost, so default or reduce-overhead is better. For 124M+ training, max-autotune starts to pay off.
+Recompilation triggers (the trap)
+Compile traces a graph for specific input shapes. If shapes change between calls, it recompiles. During decode you'd expect the same shape every step: (1, 1, ...). But there's a subtlety: if the cache position is treated as a tensor input, and that tensor's value changes, Inductor sees it as a guard violation and recompiles.
+The fix is to pass cache_pos as a plain Python int. Dynamo recognizes Python ints and bakes them in or specializes them appropriately. Never pass cache_pos as a torch.tensor(scalar). Mark dynamic dims explicitly with torch._dynamo.mark_dynamic(tensor, dim) if the prefill length varies between generations.
+Implementation
+python# bf16 training step that drops into your loop. No scaler.
+def train_step_bf16(model, opt, x, y):
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        _, loss = model(x, y)
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+    return loss.detach()
+
+
+# Compile smoke test. XPU support varies; wrap in try/except.
+def compile_check(model):
+    model.eval()
+    x = torch.randint(0, 512, (2, 64), device=device)
+    with torch.no_grad():
+        eager_logits, eager_loss = model(x, x)
+    try:
+        compiled = torch.compile(model, mode="reduce-overhead")
+        with torch.no_grad():
+            cl, cls = compiled(x, x)
+        diff = (eager_logits.float() - cl.float()).abs().max().item()
+        print(f"compile ok. logits max diff: {diff:.2e}")
+        print(f"loss eager={eager_loss.item():.4f} compiled={cls.item():.4f}")
+        return compiled
+    except Exception as e:
+        print(f"compile FAILED ({type(e).__name__}): {str(e)[:300]}")
+        return None
+Decode benchmark with compile
+pythondef bench_compiled_decode(model, prompt, steps=100):
+    model.eval()
+    eager_tps = bench(generate_with_cache, model, prompt, steps)
+    try:
+        compiled_model = torch.compile(model, mode="reduce-overhead")
+        # warmup the compiled path
+        _ = generate_with_cache(compiled_model, prompt, 5)
+        comp_tps = bench(generate_with_cache, compiled_model, prompt, steps)
+        print(f"eager:    {eager_tps:.1f} tok/s")
+        print(f"compiled: {comp_tps:.1f} tok/s ({comp_tps/eager_tps:.2f}x)")
+    except Exception as e:
+        print(f"compile path failed: {type(e).__name__}: {str(e)[:200]}")
+Follow-ups answered
+When does max-autotune win over reduce-overhead? When per-step kernel runtime is large relative to launch overhead. For training at 124M+ params with batch sizes that fill the GPU, kernels are seconds-long and autotune savings (5-15% from better block sizes) compound. For tiny decode steps with batch=1, the dominant cost is launch overhead, which CUDA Graphs (in reduce-overhead) eliminate; max-autotune adds compile time without much benefit.
+Why mark cache_pos as non-static: if cache_pos is a Python int, Dynamo specializes the graph for each value (one graph per cache position, which is catastrophic). If it's a tensor, Dynamo can mark it dynamic. The right pattern is to express cache_pos such that the write index is dynamic but the cache shape is static. Practically, use cache.k[layer].index_copy_(2, torch.tensor([cache_pos], device=...), k_new) instead of cache.k[layer][:, :, cache_pos, :] = k_new. The former is a single op with a tensor index; the latter is a Python-side slice that specializes.
+
+Part 4: MoE (A7)
+The intuition
+A standard FFN: MLP(x) = W_down(act(W_up(x))). The same weights process every token. MoE replaces this with N parallel MLPs (called experts) plus a small router that decides which expert(s) handle each token.
+Why this is good: you increase total parameter count (capacity) without increasing per-token FLOPs. With N=8 experts and top-2 routing, each token activates 2 experts, so FLOPs are roughly 2x a single FFN, but the model has 8x the FFN parameters. More parameters = more knowledge stored, more capacity for specialization.
+Why this is hard: the router is a discrete decision (argmax). Discrete decisions are not differentiable. Solution: route by softmax probabilities, then take top-k indices. Backprop flows through the top-k gating weights (which are continuous probabilities), but the which experts to send to part is discrete and gets no gradient. That's fine because the router still learns: if expert 3 produces a good output that gets weighted by p_3 = 0.7, then increasing p_3 decreases the loss, and the router adjusts.
+Routing collapse and the aux loss
+There's a failure mode: at init, the router weights are random. One expert ends up getting slightly more tokens, trains a bit faster, becomes slightly better, gets even more tokens. The other experts never get gradient because they never see tokens. You end up with effectively 1 active expert and 7 dead ones.
+The fix is an auxiliary loss that penalizes imbalanced routing. Define:
+
+f_i = fraction of tokens routed to expert i (top-1 token count / total tokens)
+p_i = mean router probability for expert i across all tokens
+
+The Switch Transformer / Mixtral aux loss is: L_aux = N * Σ_i (f_i * p_i).
+Why this formula and not KL?
+Two requirements: the loss needs to be (a) differentiable through the router weights and (b) minimized when routing is uniform.
+f_i is computed from argmax, which has zero gradient. So you can't backprop through f_i. But p_i is differentiable (it's the softmax output averaged over tokens). The trick: treat f_i as a constant weight that tells the router "this expert is over-used; reduce its probability."
+Look at the gradient: ∂L_aux/∂p_i = N * f_i. So the router gets a stronger "decrease me" gradient on experts that are receiving more tokens (high f_i). The router learns to reduce p_i for over-used experts, which redirects future tokens elsewhere.
+If you used KL divergence to a uniform distribution: KL(p || uniform) = Σ_i p_i * log(N * p_i). This penalizes p_i being non-uniform, but it doesn't account for the actual traffic. The router can output uniform p_i while still doing peaky top-1 selections (e.g., probabilities (0.13, 0.12, 0.12, ..., 0.50) with N=8 still has p_i ≈ 0.125 average if averaged over tokens that hit different argmaxes). The f_i * p_i formulation explicitly correlates traffic with probability mass and penalizes when both are high simultaneously.
+Minimum: L_aux = N * Σ f_i * p_i is minimized (subject to Σ f_i = Σ p_i = 1) when both are uniform: f_i = p_i = 1/N. Plug in: L_aux = N * N * (1/N)² = 1. So the minimum value is 1 at perfect balance. That's the floor.
+Top-k vs top-1 vs top-2
+
+Top-1 (Switch): each token goes to exactly one expert. Cheapest. But the router gets gradient signal for only one expert per token, so it's harder to learn good routing.
+Top-2 (GShard, Mixtral): each token goes to two experts, weighted by normalized probabilities. Each token gets to "compare" two experts, giving richer gradient signal. 2x compute vs top-1.
+Top-k for k≥3: rarely better. Compute scales linearly with k, and most experts beyond top-2 contribute marginally to the output.
+
+In practice top-2 is the standard. Top-1 is competitive at very large scale where you have many experts and can afford to lose some routing signal.
+Implementation with instrumentation for visualization
+pythonclass Top2MoE(nn.Module):
+    def __init__(self, d_model, d_ff, n_experts=4, expert_cls=None):
+        super().__init__()
+        self.n_experts = n_experts
+        self.router = nn.Linear(d_model, n_experts, bias=False)
+        # Default expert: a SwiGLU FFN (matches your existing model style)
+        if expert_cls is None:
+            expert_cls = lambda: SwiGLUFeedForward(d_model, d_ff, dropout=0.0)
+        self.experts = nn.ModuleList([expert_cls() for _ in range(n_experts)])
+        self.last_stats = None  # populated each forward for visualization
+
+    def forward(self, x):
+        B, T, D = x.shape
+        flat = x.reshape(B * T, D)
+        N_tok = flat.size(0)
+
+        logits = self.router(flat)                          # (N_tok, n_experts)
+        probs = F.softmax(logits, dim=-1)                   # (N_tok, n_experts)
+        top_p, top_i = torch.topk(probs, k=2, dim=-1)       # (N_tok, 2) each
+        top_p = top_p / top_p.sum(dim=-1, keepdim=True)     # renormalize
+
+        # Compute outputs by dispatching tokens to their top-2 experts.
+        out = torch.zeros_like(flat)
+        for slot in range(2):
+            assigned = top_i[:, slot]                       # (N_tok,)
+            weight = top_p[:, slot, None]                   # (N_tok, 1)
+            for e_idx, expert in enumerate(self.experts):
+                mask = (assigned == e_idx)
+                if mask.any():
+                    out[mask] += weight[mask] * expert(flat[mask])
+
+        # Aux loss components.
+        top1 = top_i[:, 0]                                  # only count top-1 traffic
+        f = F.one_hot(top1, self.n_experts).float().mean(0) # (n_experts,)
+        p = probs.mean(0)                                   # (n_experts,)
+        aux_loss = self.n_experts * (f * p).sum()
+
+        # Stash stats for plotting (detach to avoid autograd graph bloat).
+        self.last_stats = {
+            "B": B, "T": T,
+            "top_i": top_i.detach().cpu(),
+            "top_p": top_p.detach().cpu(),
+            "probs": probs.detach().cpu(),
+            "f": f.detach().cpu(),
+            "p": p.detach().cpu(),
+            "aux_loss": float(aux_loss.detach()),
+        }
+        return out.view(B, T, D), aux_loss
+A decoder layer that uses MoE on selected layers:
+pythonclass DecoderLayerMoE(nn.Module):
+    def __init__(self, d_model, num_heads, num_kv_heads, d_ff, max_seq_len, dropout, use_moe, n_experts=4):
+        super().__init__()
+        self.self_attn = GQAttentionCached(d_model, num_heads, num_kv_heads, max_seq_len, dropout)
+        self.use_moe = use_moe
+        if use_moe:
+            self.feed_forward = Top2MoE(d_model, d_ff, n_experts=n_experts)
+        else:
+            self.feed_forward = SwiGLUFeedForward(d_model, d_ff, dropout)
+        self.norm1 = RMSNorm(d_model)
+        self.norm3 = RMSNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def forward(self, x, layer_idx=None, cache=None, cache_pos=0):
+        a = self.self_attn(self.norm1(x), layer_idx=layer_idx, cache=cache, cache_pos=cache_pos)
+        x = x + self.dropout1(a)
+        f_in = self.norm3(x)
+        if self.use_moe:
+            f_out, aux = self.feed_forward(f_in)
+        else:
+            f_out, aux = self.feed_forward(f_in), None
+        x = x + self.dropout3(f_out)
+        return x, aux
+
+
+class GPTMoE(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads, num_kv_heads, d_ff, n_layer,
+                 moe_layers=(), n_experts=4, dropout=0.1, max_seq_len=512, aux_coef=0.01):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.aux_coef = aux_coef
+        self.wte = nn.Embedding(vocab_size, d_model)
+        self.layers = nn.ModuleList([
+            DecoderLayerMoE(d_model, num_heads, num_kv_heads, d_ff, max_seq_len, dropout,
+                            use_moe=(i in moe_layers), n_experts=n_experts)
+            for i in range(n_layer)
+        ])
+        self.norm = RMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.wte.weight
+        self.apply(self._init)
+
+    def _init(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if m.bias is not None: nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        x = self.wte(idx)
+        aux_total = 0.0
+        n_aux = 0
+        for i, layer in enumerate(self.layers):
+            x, aux = layer(x, layer_idx=i)
+            if aux is not None:
+                aux_total = aux_total + aux
+                n_aux += 1
+        x = self.norm(x)
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            ce = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            if n_aux > 0:
+                loss = ce + self.aux_coef * (aux_total / n_aux)
+            else:
+                loss = ce
+        return logits, loss
+Visualization
+pythonimport matplotlib.pyplot as plt
+import numpy as np
+
+def find_moe(model):
+    return [m for m in model.modules() if isinstance(m, Top2MoE)]
+
+
+def plot_balance(moe, ax=None):
+    s = moe.last_stats
+    f = s["f"].numpy(); p = s["p"].numpy()
+    if ax is None: _, ax = plt.subplots(figsize=(6, 3))
+    x = np.arange(len(f))
+    ax.bar(x - 0.18, f, width=0.36, label="top-1 token fraction (f)")
+    ax.bar(x + 0.18, p, width=0.36, label="mean router prob (p)")
+    ax.axhline(1/len(f), ls="--", c="black", lw=1, label=f"uniform = {1/len(f):.2f}")
+    ax.set_xlabel("expert"); ax.set_ylabel("fraction")
+    ax.set_title(f"aux_loss = {s['aux_loss']:.4f}  (min ≈ 1.0)")
+    ax.legend()
+
+
+def plot_routing_heatmap(moe, batch_idx=0):
+    s = moe.last_stats
+    B, T = s["B"], s["T"]
+    top1 = s["top_i"][:, 0].reshape(B, T)[batch_idx].numpy()
+    fig, ax = plt.subplots(figsize=(12, 1.5))
+    ax.imshow(top1[None, :], aspect="auto", interpolation="nearest")
+    ax.set_yticks([]); ax.set_xlabel("token position")
+    ax.set_title(f"Top-1 expert per token (batch {batch_idx})")
+    plt.tight_layout(); plt.show()
+
+
+def plot_aux_history(history):
+    plt.figure(figsize=(7, 3))
+    plt.plot(history["step"], history["ce"], label="CE loss")
+    plt.plot(history["step"], history["aux"], label="aux loss")
+    plt.axhline(1.0, ls="--", c="red", lw=1, label="aux floor")
+    plt.xlabel("step"); plt.ylabel("loss"); plt.legend()
+    plt.tight_layout(); plt.show()
+Aux-loss-over-time training (the A7 done-when)
+pythondef train_moe_track_aux(model, steps=400, lr=3e-4, batch_size=16, block_size=128):
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.1)
+    history = {"step": [], "ce": [], "aux": []}
+    moes = find_moe(model)
+    model.train()
+    for it in range(steps):
+        x, y = get_batch("train", batch_size, block_size, device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            _, loss = model(x, y)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        if it % 10 == 0:
+            # CE = total loss minus aux contribution
+            aux_now = sum(m.last_stats["aux_loss"] for m in moes) / len(moes)
+            ce_now = loss.item() - model.aux_coef * aux_now
+            history["step"].append(it); history["ce"].append(ce_now); history["aux"].append(aux_now)
+    return history
+
+
+torch.manual_seed(0)
+moe_model = GPTMoE(vocab_size=vocab_size, d_model=192, num_heads=4, num_kv_heads=2,
+                   d_ff=512, n_layer=4, moe_layers=(2,), n_experts=4,
+                   dropout=0.1, max_seq_len=128).to(device)
+hist = train_moe_track_aux(moe_model, steps=400)
+
+# Visualize
+moe_model.eval()
+with torch.no_grad():
+    x, _ = get_batch("val", 8, 128, device)
+    moe_model(x)
+plot_balance(find_moe(moe_model)[0])
+plt.show()
+plot_routing_heatmap(find_moe(moe_model)[0])
+plot_aux_history(hist)
+What you should see:
+
+aux_loss starts above 1 (random routing isn't perfectly uniform, especially at small batch).
+It decreases over training but doesn't hit 1.0 (router specialization fights the aux loss).
+The balance bar chart shows f and p close to 1/N.
+The routing heatmap shows different colors across tokens (not a single solid color, which would mean collapse).
+
+Follow-ups answered
+Why N · Σ fᵢ pᵢ vs KL: covered above. Short version: KL doesn't include the traffic f_i, only the probability p_i. The aux loss needs to penalize the joint event "expert i gets lots of traffic AND high probability mass." Multiplying f and p does exactly that, and the gradient ∂L/∂p_i = N·f_i naturally redirects probability mass away from busy experts.
+Top-1 vs top-2 vs top-k routing: top-1 is cheapest and used in Switch Transformer; works at very large scale where you have many experts. Top-2 is the modern default (Mixtral, GShard); the second expert provides a backup gradient path and a richer combination of features. Top-k for k>2 rarely pays off because the marginal expert contributes weighted by its small probability, so you do O(k) compute for diminishing returns.
+
+Part 5: PagedAttention (C1)
+The OS paging analogy
+In an operating system, virtual memory is contiguous from the program's perspective, but it's split into fixed-size pages in physical RAM. A page table maps virtual addresses to physical pages. This eliminates fragmentation: any free physical page can serve any virtual page.
+Apply this to the KV cache. With our naive cache, each sequence reserves (B, H, max_seq, D) contiguous memory upfront. If you serve concurrent requests of different lengths, you waste a ton: a 50-token sequence in a 2048-slot buffer wastes 1998 slots. If you don't pre-allocate, you fragment.
+Paged attention's fix:
+
+Carve the global KV cache into fixed-size blocks (e.g., 16 tokens per block).
+Each sequence has a block table: a list of physical block IDs. Logical position p maps to physical block block_table[p // block_size] at offset p % block_size.
+A central block allocator hands out free blocks to whichever sequence needs more.
+When a sequence finishes, its blocks return to the free pool.
+
+Result: zero fragmentation, dynamic allocation, sequences of any length can coexist, and prefix sharing becomes trivial (two sequences with the same prefix can share the same physical blocks via reference counting).
+What "block size" trades off
+
+Too small (e.g., 1): block table is huge, lots of indirection per attention step, allocator gets called constantly. Indexing overhead dominates.
+Too large (e.g., 256): a sequence of length 17 still needs a full 256-slot block. Internal fragmentation returns. Allocator works less but you waste memory.
+Sweet spot: 16 to 64 in practice. vLLM's default is 16.
+
+Implementation
+The paged cache holds one big tensor per layer, sliced into blocks. Block 0 lives at cache[layer, 0:block_size, ...], block 1 at cache[layer, block_size:2*block_size, ...], etc. The block table tells you which logical blocks map to which physical blocks.
+pythonclass PagedKVCache:
+    """A central KV cache split into fixed-size blocks.
+
+    Shape: (n_layers, n_blocks, block_size, n_kv_heads, head_dim)
+
+    Sequences are allocated blocks from a free pool. Each sequence has its own
+    block_table mapping logical block index -> physical block id.
+    """
+    def __init__(self, n_layers, n_blocks, block_size, n_kv_heads, head_dim, device, dtype):
+        self.n_layers = n_layers
+        self.n_blocks = n_blocks
+        self.block_size = block_size
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
+
+        shape = (n_layers, n_blocks, block_size, n_kv_heads, head_dim)
+        self.k = torch.zeros(shape, device=device, dtype=dtype)
+        self.v = torch.zeros(shape, device=device, dtype=dtype)
+
+        self.free_blocks = list(range(n_blocks))
+
+    def num_free(self):
+        return len(self.free_blocks)
+
+    def allocate_block(self):
+        if not self.free_blocks:
+            raise RuntimeError("Out of KV blocks")
+        return self.free_blocks.pop()
+
+    def free_blocks_list(self, block_ids):
+        for b in block_ids:
+            self.free_blocks.append(b)
+
+    def write_token(self, layer, block_id, slot, k, v):
+        """Write a single new token's K/V at (block_id, slot)."""
+        # k, v shape: (n_kv_heads, head_dim)
+        self.k[layer, block_id, slot] = k
+        self.v[layer, block_id, slot] = v
+
+    def write_tokens(self, layer, block_id, start_slot, k, v):
+        """Write multiple consecutive tokens within one block."""
+        # k, v shape: (T, n_kv_heads, head_dim), T <= block_size - start_slot
+        T = k.size(0)
+        self.k[layer, block_id, start_slot:start_slot + T] = k
+        self.v[layer, block_id, start_slot:start_slot + T] = v
+
+    def gather(self, layer, block_table, length):
+        """Gather K, V for a single sequence of given length."""
+        # Returns (length, n_kv_heads, head_dim)
+        n_full = length // self.block_size
+        rem = length - n_full * self.block_size
+
+        chunks_k, chunks_v = [], []
+        for i in range(n_full):
+            b = block_table[i]
+            chunks_k.append(self.k[layer, b])
+            chunks_v.append(self.v[layer, b])
+        if rem > 0:
+            b = block_table[n_full]
+            chunks_k.append(self.k[layer, b, :rem])
+            chunks_v.append(self.v[layer, b, :rem])
+
+        return torch.cat(chunks_k, dim=0), torch.cat(chunks_v, dim=0)
+
+
+class Sequence:
+    """A single inference request with its own block table."""
+    def __init__(self, prompt_ids, cache):
+        self.prompt_ids = prompt_ids
+        self.tokens = list(prompt_ids)
+        self.length = len(prompt_ids)
+        self.block_table = []
+        self.finished = False
+        self.cache = cache
+
+    def ensure_capacity(self, new_length):
+        """Allocate enough blocks to hold new_length tokens."""
+        bs = self.cache.block_size
+        needed_blocks = (new_length + bs - 1) // bs
+        while len(self.block_table) < needed_blocks:
+            self.block_table.append(self.cache.allocate_block())
+
+    def append_token(self, tok_id):
+        self.tokens.append(tok_id)
+        self.length += 1
+
+    def free(self):
+        self.cache.free_blocks_list(self.block_table)
+        self.block_table = []
+A paged attention forward that, given a sequence and its block table, gathers K/V from the cache, runs SDPA, and writes the new token's K/V into the right slot:
+pythonclass PagedGQAttention(nn.Module):
+    """GQA attention that reads/writes a paged KV cache for one sequence at a time.
+
+    Built to mirror the math of GQAttentionCached so generations match.
+    """
+    def __init__(self, d_model, num_heads, num_kv_heads, max_seq_len, dropout=0.0, rope_base=10000.0):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = d_model // num_heads
+        self.n_rep = num_heads // num_kv_heads
+        self.kv_dim = num_kv_heads * self.head_dim
+
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_k = nn.Linear(d_model, self.kv_dim, bias=False)
+        self.W_v = nn.Linear(d_model, self.kv_dim, bias=False)
+        self.W_o = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+        inv_freq = 1.0 / (rope_base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        t = torch.arange(max_seq_len).float()
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        self.register_buffer("rope_cos", emb.cos(), persistent=False)
+        self.register_buffer("rope_sin", emb.sin(), persistent=False)
+
+    def forward(self, x, layer_idx, paged_cache, sequence, start_pos):
+        """x: (1, T_new, d_model). Writes new K/V into the cache, returns attn out."""
+        B, T_new, _ = x.shape
+        assert B == 1, "Single-sequence forward; batch concurrent sequences manually."
+
+        Q = self.W_q(x).view(1, T_new, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.W_k(x).view(1, T_new, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        V = self.W_v(x).view(1, T_new, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        Q, K = apply_rope_at_positions(Q, K, self.rope_cos, self.rope_sin, start_pos)
+
+        # Write new K/V into the paged cache, possibly spanning blocks.
+        bs = paged_cache.block_size
+        K_to_write = K[0].transpose(0, 1)  # (T_new, n_kv_heads, head_dim)
+        V_to_write = V[0].transpose(0, 1)
+
+        write_pos = start_pos
+        idx = 0
+        while idx < T_new:
+            block_logical = write_pos // bs
+            slot = write_pos % bs
+            block_phys = sequence.block_table[block_logical]
+            chunk = min(bs - slot, T_new - idx)
+            paged_cache.write_tokens(
+                layer_idx, block_phys, slot,
+                K_to_write[idx:idx + chunk],
+                V_to_write[idx:idx + chunk],
+            )
+            write_pos += chunk
+            idx += chunk
+
+        # Read back full K, V for this sequence from the paged cache.
+        total_len = start_pos + T_new
+        K_full, V_full = paged_cache.gather(layer_idx, sequence.block_table, total_len)
+        # Add batch dim and transpose to (1, n_kv_heads, total_len, head_dim).
+        K_full = K_full.transpose(0, 1).unsqueeze(0)
+        V_full = V_full.transpose(0, 1).unsqueeze(0)
+
+        K_full = repeat_kv(K_full, self.n_rep)
+        V_full = repeat_kv(V_full, self.n_rep)
+
+        is_causal = (start_pos == 0 and T_new > 1)
+        attn = F.scaled_dot_product_attention(
+            Q, K_full, V_full, dropout_p=0.0, is_causal=is_causal,
+        )
+        out = attn.transpose(1, 2).contiguous().view(1, T_new, self.d_model)
+        return self.W_o(out)
+A model wrapper that uses the paged attention and a runner that schedules multiple sequences:
+pythonclass GPTPaged(nn.Module):
+    """Drop-in alternative to GPTGQA, using paged attention. Same forward signature
+    but takes (paged_cache, sequence, start_pos) instead of contiguous cache."""
+    def __init__(self, vocab_size, d_model, num_heads, num_kv_heads, d_ff, n_layer,
+                 dropout=0.1, max_seq_len=512):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.n_layer = n_layer
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = d_model // num_heads
+        self.d_model = d_model
+
+        self.wte = nn.Embedding(vocab_size, d_model)
+        self.attns = nn.ModuleList([
+            PagedGQAttention(d_model, num_heads, num_kv_heads, max_seq_len, dropout)
+            for _ in range(n_layer)
+        ])
+        self.ffs = nn.ModuleList([SwiGLUFeedForward(d_model, d_ff, dropout) for _ in range(n_layer)])
+        self.norms1 = nn.ModuleList([RMSNorm(d_model) for _ in range(n_layer)])
+        self.norms3 = nn.ModuleList([RMSNorm(d_model) for _ in range(n_layer)])
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        self.norm = RMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.wte.weight
+
+    def step(self, idx, paged_cache, sequence, start_pos):
+        """idx: (1, T_new). Returns logits (1, T_new, vocab)."""
+        x = self.wte(idx)
+        for i in range(self.n_layer):
+            a = self.attns[i](self.norms1[i](x), i, paged_cache, sequence, start_pos)
+            x = x + self.dropout1(a)
+            f = self.ffs[i](self.norms3[i](x))
+            x = x + self.dropout3(f)
+        x = self.norm(x)
+        return self.lm_head(x)
+
+
+@torch.inference_mode()
+def generate_paged(model, paged_cache, sequence, max_new):
+    # Prefill
+    sequence.ensure_capacity(sequence.length)
+    prompt = torch.tensor([sequence.prompt_ids], dtype=torch.long, device=next(model.parameters()).device)
+    logits = model.step(prompt, paged_cache, sequence, start_pos=0)
+    nxt = int(logits[0, -1].argmax())
+    sequence.append_token(nxt)
+
+    # Decode loop
+    for _ in range(max_new - 1):
+        sequence.ensure_capacity(sequence.length + 1)
+        nxt_t = torch.tensor([[sequence.tokens[-1]]],
+                             dtype=torch.long, device=next(model.parameters()).device)
+        logits = model.step(nxt_t, paged_cache, sequence, start_pos=sequence.length - 1)
+        nxt = int(logits[0, -1].argmax())
+        sequence.append_token(nxt)
+    return sequence.tokens
+Verification: paged matches contiguous
+Build a paged model and a contiguous-GQA model with the same weights, then check that they produce the same tokens.
+pythontorch.manual_seed(0)
+
+# Reference: contiguous GQA model
+ref = GPTGQA(vocab_size=512, d_model=128, num_heads=4, num_kv_heads=2,
+             d_ff=256, n_layer=3, dropout=0.0, max_seq_len=256).to(device).eval()
+
+# Paged model with the same architecture
+pag = GPTPaged(vocab_size=512, d_model=128, num_heads=4, num_kv_heads=2,
+               d_ff=256, n_layer=3, dropout=0.0, max_seq_len=256).to(device).eval()
+
+# Copy weights so they're literally the same model
+def copy_weights_gqa_to_paged(src, dst):
+    dst.wte.load_state_dict(src.wte.state_dict())
+    dst.lm_head.weight = dst.wte.weight  # tied
+    dst.norm.load_state_dict(src.norm.state_dict())
+    for i, layer in enumerate(src.layers):
+        dst.attns[i].W_q.load_state_dict(layer.self_attn.W_q.state_dict())
+        dst.attns[i].W_k.load_state_dict(layer.self_attn.W_k.state_dict())
+        dst.attns[i].W_v.load_state_dict(layer.self_attn.W_v.state_dict())
+        dst.attns[i].W_o.load_state_dict(layer.self_attn.W_o.state_dict())
+        dst.ffs[i].load_state_dict(layer.feed_forward.state_dict())
+        dst.norms1[i].load_state_dict(layer.norm1.state_dict())
+        dst.norms3[i].load_state_dict(layer.norm3.state_dict())
+
+copy_weights_gqa_to_paged(ref, pag)
+
+prompt_ids = torch.randint(0, 512, (1, 16), device=device)
+ref_out = generate_with_cache(ref, prompt_ids, max_new=50)[0].tolist()
+
+paged_cache = PagedKVCache(n_layers=3, n_blocks=64, block_size=16,
+                           n_kv_heads=2, head_dim=32, device=device, dtype=torch.float32)
+seq = Sequence(prompt_ids[0].tolist(), paged_cache)
+pag_out = generate_paged(pag, paged_cache, seq, max_new=50)
+
+print("ref :", ref_out[:30])
+print("pag :", pag_out[:30])
+print("match:", ref_out == pag_out)
+If they don't match, the most common cause is an off-by-one in start_pos (decode passes sequence.length - 1 because the new token was already appended; the model is computing the embedding for the current token, which is at logical position length - 1).
+Two concurrent sequences
+Run two sequences of different lengths through the same allocator, lockstep one decode step at a time, and verify both produce the same output as if you ran each alone:
+pythondef run_concurrent(model, cache, prompts, max_new):
+    """Run multiple sequences in lockstep, sharing one paged cache."""
+    seqs = [Sequence(p, cache) for p in prompts]
+
+    # Prefill each sequence
+    for s in seqs:
+        s.ensure_capacity(s.length)
+        ids = torch.tensor([s.prompt_ids], dtype=torch.long, device=next(model.parameters()).device)
+        logits = model.step(ids, cache, s, start_pos=0)
+        s.append_token(int(logits[0, -1].argmax()))
+
+    # Decode in lockstep
+    for _ in range(max_new - 1):
+        for s in seqs:
+            if s.finished:
+                continue
+            s.ensure_capacity(s.length + 1)
+            nxt_t = torch.tensor([[s.tokens[-1]]], dtype=torch.long, device=next(model.parameters()).device)
+            logits = model.step(nxt_t, cache, s, start_pos=s.length - 1)
+            s.append_token(int(logits[0, -1].argmax()))
+    return seqs
+
+
+# Run together vs alone, verify identical
+torch.manual_seed(0)
+prompts = [
+    torch.randint(0, 512, (8,), device=device).tolist(),
+    torch.randint(0, 512, (24,), device=device).tolist(),
+]
+
+cache_together = PagedKVCache(3, 64, 16, 2, 32, device, torch.float32)
+seqs = run_concurrent(pag, cache_together, prompts, max_new=20)
+
+# Now run each alone
+solo_outputs = []
+for p in prompts:
+    cache_solo = PagedKVCache(3, 64, 16, 2, 32, device, torch.float32)
+    s = Sequence(p, cache_solo)
+    solo_outputs.append(generate_paged(pag, cache_solo, s, max_new=20))
+
+for i, (s, alone) in enumerate(zip(seqs, solo_outputs)):
+    print(f"seq {i}: concurrent matches solo? {s.tokens == alone}")
+Free-on-completion and waste accounting
+pythondef memory_waste_report(cache, sequences):
+    bs = cache.block_size
+    used_blocks = sum(len(s.block_table) for s in sequences)
+    used_slots = used_blocks * bs
+    actually_used_slots = sum(s.length for s in sequences)
+    waste = used_slots - actually_used_slots
+    pct = 100 * waste / max(used_slots, 1)
+    print(f"used blocks: {used_blocks}/{cache.n_blocks}  ({100*used_blocks/cache.n_blocks:.1f}% capacity)")
+    print(f"slots used: {used_slots}, actually filled: {actually_used_slots}")
+    print(f"internal waste: {waste} slots ({pct:.1f}%)")
+
+
+# After running concurrent sequences:
+memory_waste_report(cache_together, seqs)
+
+# Free one sequence and verify blocks return to the pool
+free_before = cache_together.num_free()
+seqs[0].free()
+free_after = cache_together.num_free()
+print(f"freed sequence 0: {free_after - free_before} blocks returned to pool")
+For mixed lengths with block_size=16, you should see waste under 10% with sequences in the 30-200 token range. With block_size=64, waste rises (last block is more often partially filled). With block_size=4, waste is near zero but the block table is huge.
+Follow-ups answered
+Right block size for your model: depends on the typical sequence length distribution. Rule of thumb: pick block_size ≈ median_seq_length / 16. If most sequences are 256-2048 tokens, block size 16-64 keeps waste under 10%. If you have very short sequences (chat completion tails), smaller blocks help. The other constraint is alignment: blocks should fit in L2/SRAM tiles for fast attention kernels. vLLM's default 16 was chosen so that one block of (16, n_heads, head_dim) fits comfortably in shared memory for typical model sizes.
+How prefix caching plugs in: add reference counts to blocks. When two sequences share a prefix, they share the same physical blocks for the prefix portion of their block tables. The allocator increments refcount when assigning a shared block; freeing only actually reclaims the block when refcount hits zero. The complication is copy-on-write: if sequence A wants to extend a shared block (write a new token into it), but sequence B is still using the same block in shared mode, A must allocate a fresh block, copy the prefix into it, and write the new token there. This is identical to OS-level COW for fork(), and it's why production serving systems like vLLM track refcounts at block granularity.
+
+What to do on the plane
+The order I'd run things:
+
+KV cache (Part 1). Verify exact match. This is the foundation; everything else builds on it.
+GQA (Part 2). Verify cache size scaling. Run the MHA/GQA/MQA training comparison so you have numbers.
+bf16 + compile (Part 3). Just modify your existing training cell. The compile path may or may not work fully on XPU 2.10; the bf16 path will definitely work.
+MoE (Part 4). Train for 400 steps, watch the aux loss decrease, plot the balance.
+PagedAttention (Part 5). Verify it matches the contiguous version, then run the two-sequence concurrent demo, then the waste accounting.
+
+Total time at small scale: about 4-6 hours of focused work, well within a 15-hour flight. Each section is independently verifiable, so if you get stuck on one you can move to the next without blocking.
+For interview defensibility, the key things to be able to explain cold:
+
+Why the cache works at all (K_i and V_i depend only on x_i and the projection matrices, both fixed across decode steps)
+The prefill/decode regime distinction (compute-bound vs memory-bound)
+Why bf16 doesn't need GradScaler (same exponent range as fp32, no underflow)
+The MoE aux loss formula derivation (f_i is non-differentiable, multiplying by p_i provides the gradient pathway, gradient is N·f_i per p_i)
+The OS analogy for paged attention and why it eliminates fragmentation
+
+Good luck on the flight.
