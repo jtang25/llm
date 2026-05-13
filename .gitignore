@@ -1,2 +1,6 @@
 .venv
 best_model.pt
+annas-arch-da37a83a6833.pdf
+gpt_model.pth
+models/
+outputs/
