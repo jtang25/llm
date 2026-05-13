@@ -4,3 +4,6 @@ annas-arch-da37a83a6833.pdf
 gpt_model.pth
 models/
 outputs/
+data/tinystories/
+__pycache__/
+*.pyc
