@@ -7,3 +7,4 @@ outputs/
 data/tinystories/
 __pycache__/
 *.pyc
+*.bin
