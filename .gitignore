@@ -1,10 +1,9 @@
 .venv
 best_model.pt
-annas-arch-da37a83a6833.pdf
 gpt_model.pth
 models/
 outputs/
-data/tinystories/
+data/
 __pycache__/
 *.pyc
 *.bin
